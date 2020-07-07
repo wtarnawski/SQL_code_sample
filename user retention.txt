@@ -1,0 +1,157 @@
+-- Here is a fully functional query that returns results filterable by app version, country and plaform from a preprocessed Firebase events.
+-- We take only dates later than 2019-06-21 in account, as it's when the app's open beta version was released to the stores.
+
+WITH
+  dates_table AS (
+  SELECT
+    GENERATE_DATE_ARRAY('2019-06-21', CURRENT_DATE(), INTERVAL 1 day) AS date_array
+  ),
+    
+  start AS (
+  SELECT
+    date_array,
+    GENERATE_ARRAY(0,90) AS retention_days
+  FROM
+    dates_table,
+    UNNEST(date_array) AS date_array
+  ),
+    
+  pre_ret_table AS (
+  SELECT
+    date_array,
+    retention_day
+  FROM
+    start,
+    UNNEST(retention_days) AS retention_day
+  ),
+    
+  countries AS (
+  SELECT
+    DISTINCT geo.country AS country
+  FROM
+    `_.analytics_191303830.preprocessed_events` 
+  ),
+    
+  platforms AS (
+  SELECT
+    DISTINCT platform
+  FROM
+    `_.analytics_191303830.preprocessed_events`
+  ),
+    
+  versions AS (
+  SELECT
+    DISTINCT app_info.version AS version
+  FROM
+    `_.analytics_191303830.preprocessed_events`
+  WHERE
+    app_info.version LIKE '1.%'
+  ),
+
+-- we're making a huge cross-join of the data, as if any combination is missing, you would get wrong results
+  ret_table AS (
+  SELECT
+    pre_ret_table.date_array install_date,
+    pre_ret_table.retention_day retention_day,
+    countries.country,
+    platforms.platform,
+    versions.version
+  FROM
+    pre_ret_table,
+    countries,
+    platforms,
+    versions 
+  ),
+    
+-- If a user for example travels and launches an app in two separate countries, he would be accounted twice with the "base" query. 
+-- So we extract the country of origin of a user (a country in which he opened the app first) and the latest version he played (please note the DESC operator).
+-- Wouldn't have to do that if we joined this info on user_id in preprocessing, but I wished to show it here.
+
+  country_and_version_of_user_id AS (
+  SELECT
+    DISTINCT user_id,
+    event_date,
+    FIRST_VALUE(geo.country) OVER (PARTITION BY user_id ORDER BY event_timestamp) AS real_country,
+    FIRST_VALUE(app_info.version ) OVER (PARTITION BY user_id ORDER BY event_timestamp DESC) AS real_version
+  FROM
+    `_.analytics_191303830.preprocessed_events` 
+  ),
+
+-- In the preprocessing of the raw data we add a "retention_day" column, which is a difference in days between the timestamp of an event and the timestamp of user's first touch. We only take a user into account if he generates a default Firebase event called "user_engagement" - this filters out some users who just "app_remove" or "os_update" on a specific day.
+  pre_base AS (
+  SELECT
+    b.real_country AS country,
+    platform AS platform,
+    b.real_version AS version,
+    a.user_id AS user_id,
+    a.retention_day AS retention_day,
+    DATE(a.joining_timestamp) AS install_date
+  FROM
+    `_.analytics_191303830.preprocessed_events` a
+  LEFT JOIN
+    country_and_version_of_user_id b
+  ON
+    a.user_id = b.user_id
+    AND a.event_date = b.event_date
+    AND a.geo.country = b.real_country
+  WHERE
+    event_name = 'user_engagement' 
+  ),
+    
+  base AS (
+  SELECT
+    install_date,
+    country,
+    platform,
+    version,
+    retention_day,
+    COUNT(DISTINCT user_id) AS users
+  FROM
+    pre_base
+  GROUP BY
+    1,
+    2,
+    3,
+    4,
+    5 
+  ),
+    
+  day_0_per_date AS(
+  SELECT
+    * EXCEPT(retention_day)
+  FROM
+    base
+  WHERE
+    base.retention_day = 0 
+  )
+    
+-- In the end we join the actual data with the huge cross join we created with "ret_table" query.
+SELECT
+  a.*,
+  b.users,
+  c.users AS users_joined_that_day
+FROM
+  ret_table a
+LEFT JOIN
+  base b
+USING
+  (
+  install_date,
+  country,
+  platform,
+  version,
+  retention_day
+  )
+LEFT JOIN
+  day_0_per_date c
+USING
+  (
+  install_date,
+  country,
+  platform,
+  version
+  )
+WHERE
+  DATE_DIFF(CURRENT_DATE(), install_date, DAY) > retention_day
+
+-- This data is then pulled by Google Data Studio visualisation. There we add the custom column called retention_rate, which is SUM(users)/SUM(users_joined_that_day). It serves as a metric in the pivot table with install_date as rows and retention_day as columns.
